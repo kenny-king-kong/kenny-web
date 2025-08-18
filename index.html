@@ -13,124 +13,468 @@
 <body>
   <canvas id="pong" width="800" height="500"></canvas>
   <script>
-    const canvas = document.getElementById('pong');
-    const context = canvas.getContext('2d');
+import React, { useEffect, useRef, useState } from "react";
 
-    // create objects
-    const paddleWidth = 10;
-    const paddleHeight = 100;
-    const ballSize = 10;
-    const player = { x: 0, y: canvas.height / 2 - paddleHeight / 2, width: paddleWidth, height: paddleHeight, color: '#FFF', score: 0 };
-    const computer = { x: canvas.width - paddleWidth, y: canvas.height / 2 - paddleHeight / 2, width: paddleWidth, height: paddleHeight, color: '#FFF', score: 0 };
-    const ball = { x: canvas.width / 2 - ballSize / 2, y: canvas.height / 2 - ballSize / 2, size: ballSize, speed: 5, velocityX: 5, velocityY: 5, color: '#05EDFF' };
+// ✅ IMPORTANT: CDN ESM build exposes a **default** export only.
+// Never do: import { Engine, Render } from "matter-js"
+// Do this instead:
+import Matter from "matter-js";
+const {
+  Engine,
+  Render,
+  Runner,
+  World,
+  Bodies,
+  Body,
+  Composite,
+  Composites,
+  Events,
+  Mouse,
+  MouseConstraint,
+} = Matter;
 
-    // draw rectangle
-    function drawRect(x, y, w, h, color) {
-      context.fillStyle = color;
-      context.fillRect(x, y, w, h);
+// ---------- Types ----------
+type Bin = { x: number; w: number; score: number };
+type BuiltWorld = {
+  width: number;
+  height: number;
+  bins: Bin[];
+};
+
+// ---------- Helpers ----------
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+const rand = (a: number, b: number) => a + Math.random() * (b - a);
+
+// Public util (used by tests)
+export function binIndexForX(x: number, width: number, bins: number) {
+  return clamp(Math.floor((x / width) * bins), 0, bins - 1);
+}
+
+function makeBins(width: number, binCount = 8): Bin[] {
+  const w = width / binCount;
+  const base = [100, 250, 500, 1000];
+  const scores = [...base, ...base.slice().reverse()];
+  return Array.from({ length: binCount }, (_, i) => ({
+    x: i * w,
+    w,
+    score: scores[i] ?? 100,
+  }));
+}
+
+function makePegBodies(width: number, height: number): Matter.Body[] {
+  const pegs: Matter.Body[] = [];
+  const margin = 60;
+  const areaTop = 80; // spawn space
+  const areaBottom = height - 120; // above bins
+  const spacingX = 42;
+  const spacingY = 38;
+  const r = 6;
+
+  let row = 0;
+  for (let y = areaTop; y < areaBottom; y += spacingY) {
+    const offset = row % 2 === 0 ? 0 : spacingX / 2;
+    for (let x = margin + offset; x < width - margin; x += spacingX) {
+      pegs.push(
+        Bodies.circle(x, y, r, {
+          isStatic: true,
+          restitution: 0.9,
+          render: { fillStyle: "#94a3b8" },
+        })
+      );
     }
+    row++;
+  }
+  return pegs;
+}
 
-    // draw circle (ball)
-    function drawBall(x, y, r, color) {
-      context.fillStyle = color;
-      context.beginPath();
-      context.arc(x, y, r, 0, Math.PI * 2, false);
-      context.closePath();
-      context.fill();
+function buildStatic(engine: Matter.Engine, width: number, height: number) {
+  const world = engine.world;
+  World.clear(world, false);
+
+  const floorY = height - 90;
+  const thickness = 50;
+
+  // Walls/floor
+  const walls = [
+    Bodies.rectangle(width / 2, height + thickness / 2, width, thickness, {
+      isStatic: true,
+      label: "floor",
+      render: { fillStyle: "#0b0f1b" },
+    }),
+    Bodies.rectangle(-thickness / 2, height / 2, thickness, height, { isStatic: true, label: "wall-left" }),
+    Bodies.rectangle(width + thickness / 2, height / 2, thickness, height, { isStatic: true, label: "wall-right" }),
+  ];
+
+  // Lip above bins
+  const lip = Bodies.rectangle(width / 2, floorY, width, 6, {
+    isStatic: true,
+    label: "bin-lip",
+    render: { fillStyle: "rgba(255,255,255,0.15)" },
+  });
+
+  // Dividers + sensors
+  const bins = makeBins(width);
+  const dividers: Matter.Body[] = [];
+  const sensors: Matter.Body[] = [];
+  for (let i = 0; i < bins.length; i++) {
+    const b = bins[i];
+
+    // Vertical divider (drawn as thin rect)
+    const divider = Bodies.rectangle(b.x, (floorY + height) / 2, 2, height - floorY, {
+      isStatic: true,
+      label: `divider-${i}`,
+      render: { fillStyle: "rgba(255,255,255,0.15)" },
+    });
+    dividers.push(divider);
+
+    // Invisible scoring sensor (thin horizontal)
+    const sensor = Bodies.rectangle(b.x + b.w / 2, height - 20, b.w - 6, 8, {
+      isStatic: true,
+      isSensor: true,
+      label: `bin-sensor-${i}`,
+      render: { visible: false },
+    }) as Matter.Body & { plugin?: { binIndex?: number } };
+    (sensor as any).plugin = { binIndex: i };
+    sensors.push(sensor);
+  }
+
+  World.add(world, [...walls, lip, ...dividers, ...sensors, ...makePegBodies(width, height)]);
+  return { bins };
+}
+
+// ---------- Component ----------
+export default function PachinkoMatter() {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  const [score, setScore] = useState(0);
+  const [gravity, setGravity] = useState(1.0); // Matter gravity.y
+  const [autoDrop, setAutoDrop] = useState(false);
+
+  // Matter instances
+  const engineRef = useRef<Matter.Engine | null>(null);
+  const renderRef = useRef<Matter.Render | null>(null);
+  const runnerRef = useRef<Matter.Runner | null>(null);
+  const mouseConstraintRef = useRef<Matter.MouseConstraint | null>(null);
+
+  const builtRef = useRef<BuiltWorld | null>(null);
+  const sizeRef = useRef({ w: 640, h: 860 });
+  const autoTimerRef = useRef(0);
+
+  // Full teardown
+  function teardown() {
+    const runner = runnerRef.current;
+    const render = renderRef.current;
+    const engine = engineRef.current;
+
+    if (runner) {
+      Runner.stop(runner);
+      runnerRef.current = null;
     }
-
-    // draw text
-    function drawText(text, x, y, color) {
-      context.fillStyle = color;
-      context.font = '32px sans-serif';
-      context.fillText(text, x, y);
-    }
-
-    // control player paddle
-    canvas.addEventListener('mousemove', movePaddle);
-    function movePaddle(evt) {
-      const rect = canvas.getBoundingClientRect();
-      player.y = evt.clientY - rect.top - player.height / 2;
-    }
-
-    // reset ball
-    function resetBall() {
-      ball.x = canvas.width / 2 - ballSize / 2;
-      ball.y = canvas.height / 2 - ballSize / 2;
-      ball.velocityX = -ball.velocityX;
-      ball.speed = 5;
-    }
-
-    // collision detection
-    function collision(b, p) {
-      return b.x < p.x + p.width && b.x + b.size > p.x && b.y < p.y + p.height && b.y + b.size > p.y;
-    }
-
-    // update game
-    function update() {
-      // ball movement
-      ball.x += ball.velocityX;
-      ball.y += ball.velocityY;
-
-      // computer paddle (simple AI)
-      const computerLevel = 0.1;
-      computer.y += (ball.y - (computer.y + computer.height / 2)) * computerLevel;
-
-      // top and bottom collision
-      if (ball.y + ball.size > canvas.height || ball.y < 0) {
-        ball.velocityY = -ball.velocityY;
+    if (render) {
+      Render.stop(render);
+      // Remove canvas to avoid stacking multiple canvases
+      if (render.canvas?.parentNode) {
+        render.canvas.parentNode.removeChild(render.canvas);
       }
+      renderRef.current = null;
+    }
+    if (engine) {
+      // Remove event handlers
+      Events.off(engine);
+      Composite.clear(engine.world, false);
+      engineRef.current = null;
+    }
+    mouseConstraintRef.current = null;
+    builtRef.current = null;
+  }
 
-      // paddle collision
-      let playerPaddle = (ball.x < canvas.width / 2) ? player : computer;
-      if (collision(ball, playerPaddle)) {
-        // where the ball hit the paddle
-        let collidePoint = (ball.y + ball.size/2) - (playerPaddle.y + playerPaddle.height/2);
-        collidePoint = collidePoint / (playerPaddle.height/2);
-        // angle in radians
-        let angleRad = (Math.PI/4) * collidePoint;
-        // direction
-        let direction = (ball.x < canvas.width/2) ? 1 : -1;
-        // change velocity
-        ball.velocityX = direction * ball.speed * Math.cos(angleRad);
-        ball.velocityY = ball.speed * Math.sin(angleRad);
-        // increase speed
-        ball.speed += 0.5;
+  // Create Matter world
+  function setup(width: number, height: number) {
+    teardown();
+
+    const engine = Engine.create();
+    engine.gravity.y = gravity;
+
+    const render = Render.create({
+      element: containerRef.current as HTMLElement,
+      engine,
+      options: {
+        width,
+        height,
+        wireframes: false,
+        background: "#020617", // slate-950
+        pixelRatio: window.devicePixelRatio || 1,
+      },
+    });
+
+    const runner = Runner.create();
+
+    const { bins } = buildStatic(engine, width, height);
+    builtRef.current = { width, height, bins };
+
+    // Mouse
+    const mouse = Mouse.create(render.canvas);
+    const mouseConstraint = MouseConstraint.create(engine, {
+      mouse,
+      constraint: { stiffness: 0.2, render: { visible: false } },
+    });
+    World.add(engine.world, mouseConstraint);
+    render.mouse = mouse;
+    mouseConstraintRef.current = mouseConstraint;
+
+    // Scoring: when a ball collides with a bin sensor
+    Events.on(engine, "collisionStart", (evt) => {
+      for (const pair of evt.pairs) {
+        const a = pair.bodyA;
+        const b = pair.bodyB;
+        const sensor = [a, b].find((x) => (x as any).isSensor && (x.label || "").startsWith("bin-sensor-"));
+        const ball = [a, b].find((x) => (x.label || "") === "ball");
+
+        if (sensor && ball) {
+          const i = (sensor as any).plugin?.binIndex ?? 0;
+          const binsLocal = builtRef.current?.bins ?? [];
+          const earned = binsLocal[i]?.score ?? 0;
+
+          // Prevent double-scoring for the same ball-sensor pair
+          if (!(ball as any).scored) {
+            (ball as any).scored = true;
+            setScore((s) => s + earned);
+          }
+        }
       }
+    });
 
-      // score update
-      if (ball.x + ball.size < 0) {
-        computer.score++;
-        resetBall();
-      } else if (ball.x > canvas.width) {
-        player.score++;
-        resetBall();
+    Render.run(render);
+    Runner.run(runner, engine);
+
+    engineRef.current = engine;
+    renderRef.current = render;
+    runnerRef.current = runner;
+
+    // Click-to-drop
+    const onClick = (e: MouseEvent) => {
+      const rect = render.canvas.getBoundingClientRect();
+      const x = clamp(e.clientX - rect.left, 30, width - 30);
+      spawnBall(x, 20);
+    };
+    render.canvas.addEventListener("click", onClick);
+    (render as any)._onClickHandler = onClick;
+  }
+
+  // Spawn a ball
+  function spawnBall(x: number, y = 20) {
+    const engine = engineRef.current;
+    const render = renderRef.current;
+    if (!engine || !render) return;
+
+    const r = 7;
+    const color = `hsl(${Math.floor(rand(0, 360))} 80% 55%)`;
+    const ball = Bodies.circle(x, y, r, {
+      restitution: 0.85,
+      friction: 0.02,
+      frictionAir: 0.008,
+      label: "ball",
+      render: { fillStyle: color },
+    });
+    Body.setVelocity(ball, { x: rand(-1.5, 1.5), y: 0 });
+    World.add(engine.world, ball);
+  }
+
+  // Auto-drop using Runner "tick"
+  useEffect(() => {
+    const runner = runnerRef.current;
+    if (!runner) return;
+
+    const onTick = (evt: Matter.IEventTimestamped<Matter.Runner>) => {
+      if (!autoDrop) return;
+      autoTimerRef.current += (evt.delta || 16.7) / 1000;
+      if (autoTimerRef.current > 0.6) {
+        const w = sizeRef.current.w;
+        spawnBall(clamp(w / 2 + rand(-30, 30), 30, w - 30));
+        autoTimerRef.current = 0;
       }
-    }
+    };
 
-    // render game
-    function render() {
-      // clear canvas
-      drawRect(0, 0, canvas.width, canvas.height, '#000');
-      // draw scores
-      drawText(player.score, canvas.width/4, canvas.height/5, '#FFF');
-      drawText(computer.score, 3*canvas.width/4, canvas.height/5, '#FFF');
-      // draw paddles
-      drawRect(player.x, player.y, player.width, player.height, player.color);
-      drawRect(computer.x, computer.y, computer.width, computer.height, computer.color);
-      // draw ball
-      drawBall(ball.x + ball.size/2, ball.y + ball.size/2, ball.size/2, ball.color);
-    }
+    Events.on(runner, "tick", onTick);
+    return () => {
+      Events.off(runner, "tick", onTick as any);
+    };
+  }, [autoDrop]);
 
-    // game loop
-    function gameLoop() {
-      update();
-      render();
-      requestAnimationFrame(gameLoop);
-    }
+  // Gravity changes
+  useEffect(() => {
+    if (engineRef.current) engineRef.current.gravity.y = gravity;
+  }, [gravity]);
 
-    // start
-    gameLoop();
+  // Mount + responsive resize
+  useEffect(() => {
+    const container = containerRef.current!;
+    const ro = new ResizeObserver((entries) => {
+      const rect = entries[0].contentRect;
+      const w = Math.max(360, Math.floor(rect.width));
+      const h = Math.max(540, Math.floor(rect.height));
+      sizeRef.current = { w, h };
+      setup(w, h);
+      setScore(0);
+    });
+    ro.observe(container);
+
+    // Initial layout (in case observer fires late)
+    const rect = container.getBoundingClientRect();
+    const w = Math.max(360, Math.floor(rect.width || 640));
+    const h = Math.max(540, Math.floor(rect.height || 860));
+    sizeRef.current = { w, h };
+    setup(w, h);
+
+    return () => {
+      const render = renderRef.current as any;
+      if (render?._onClickHandler && render.canvas) {
+        render.canvas.removeEventListener("click", render._onClickHandler);
+      }
+      ro.disconnect();
+      teardown();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Reset
+  function reset() {
+    const { w, h } = sizeRef.current;
+    setScore(0);
+    setup(w, h);
+  }
+
+  const built = builtRef.current;
+  const canvasHeight = sizeRef.current.h;
+  const floorY = canvasHeight - 90;
+
+  return (
+    <div className="relative w-full h-[80vh] min-h-[560px] bg-neutral-900 rounded-2xl shadow-xl overflow-hidden">
+      {/* Canvas host for Matter.Render */}
+      <div ref={containerRef} className="absolute inset-0" />
+
+      {/* HUD */}
+      <div className="absolute left-3 top-3 z-10 flex flex-col gap-2 p-3 rounded-2xl bg-black/30 backdrop-blur text-white border border-white/10 pointer-events-auto">
+        <div className="text-sm opacity-80">Score</div>
+        <div className="text-3xl font-semibold tabular-nums">{score}</div>
+        <div className="h-px bg-white/10 my-1" />
+
+        <label className="text-sm">
+          Gravity Y: <span className="tabular-nums">{gravity.toFixed(2)}</span>
+        </label>
+        <input
+          className="w-56"
+          type="range"
+          min={0.2}
+          max={2.0}
+          step={0.05}
+          value={gravity}
+          onChange={(e) => setGravity(parseFloat(e.target.value))}
+        />
+
+        <div className="flex gap-2 pt-1">
+          <button
+            className="px-3 py-1.5 rounded-xl bg-white/90 text-black text-sm font-medium hover:bg-white"
+            onClick={() => {
+              const w = sizeRef.current.w;
+              spawnBall(clamp(w / 2 + rand(-30, 30), 30, w - 30));
+            }}
+          >
+            Drop ball
+          </button>
+          <button
+            className={`px-3 py-1.5 rounded-xl text-sm font-medium border ${
+              autoDrop
+                ? "bg-emerald-400 text-black border-emerald-500"
+                : "bg-black/20 text-white border-white/15 hover:bg-black/30"
+            }`}
+            onClick={() => setAutoDrop((v) => !v)}
+          >
+            {autoDrop ? "Auto: ON" : "Auto: OFF"}
+          </button>
+          <button
+            className="px-3 py-1.5 rounded-xl text-sm font-medium bg-black/20 text-white border border-white/15 hover:bg-black/30"
+            onClick={reset}
+          >
+            Reset
+          </button>
+        </div>
+        <div className="text-xs opacity-70 pt-1">Tip: click the board to spawn where you click.</div>
+      </div>
+
+      {/* Bin labels overlay for crisp text */}
+      {built && (
+        <div
+          className="absolute left-0"
+          style={{
+            top: floorY + 8,
+            right: 0,
+            display: "flex",
+            width: built.width,
+            pointerEvents: "none",
+            justifyContent: "space-between",
+            color: "rgba(255,255,255,0.8)",
+            fontSize: 12,
+          }}
+        >
+          {built.bins.map((b, i) => (
+            <div key={i} style={{ width: b.w, textAlign: "center" }}>
+              {b.score}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* =========================
+   Tests (Vitest)
+   =========================
+   Keep existing tests as-is; add more edge cases below.
+   Save as PachinkoMatter.test.ts (or colocate with .tsx if preferred)
+
+import { describe, it, expect } from "vitest";
+import { binIndexForX } from "./PachinkoMatter";
+
+describe("binIndexForX", () => {
+  it("maps x to correct bin", () => {
+    const width = 800;
+    const bins = 8;
+    expect(binIndexForX(0, width, bins)).toBe(0);
+    expect(binIndexForX(799, width, bins)).toBe(7);
+    expect(binIndexForX(400, width, bins)).toBe(4); // middle-right
+    expect(binIndexForX(100, width, bins)).toBe(1);
+  });
+
+  it("clamps out-of-range x", () => {
+    const width = 800;
+    const bins = 8;
+    expect(binIndexForX(-100, width, bins)).toBe(0);
+    expect(binIndexForX(5000, width, bins)).toBe(7);
+  });
+
+  // New tests
+  it("handles minimal bin count", () => {
+    const width = 500;
+    const bins = 1;
+    expect(binIndexForX(0, width, bins)).toBe(0);
+    expect(binIndexForX(250, width, bins)).toBe(0);
+    expect(binIndexForX(499, width, bins)).toBe(0);
+  });
+
+  it("rounds down consistently across boundaries", () => {
+    const width = 800;
+    const bins = 8; // 100px per bin
+    expect(binIndexForX(99.999, width, bins)).toBe(0);
+    expect(binIndexForX(100, width, bins)).toBe(1);
+    expect(binIndexForX(199.999, width, bins)).toBe(1);
+    expect(binIndexForX(200, width, bins)).toBe(2);
+  });
+});
+*/
+
   </script>
 </body>
 </html>
+
