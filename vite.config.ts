@@ -1,5 +1,6 @@
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
+import { defineConfig } from 'vite';
+
+// Replace REPO_NAME with your repo name or '/' for user/org pages
 export default defineConfig({
-  plugins: [react()]
+  base: '/REPO_NAME/',
 });
