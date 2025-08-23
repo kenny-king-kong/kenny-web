@@ -10,7 +10,7 @@ pnpm-lock.yaml
 
 # Vite build
 dist/
-docs/
+# docs/
 *.local
 
 # Editor folders
