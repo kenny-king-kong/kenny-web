@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "postbuild": "rm -rf docs && mv dist docs"
   },
   "devDependencies": {
     "vite": "^5.0.0",
