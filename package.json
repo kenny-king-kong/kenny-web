@@ -1,17 +1,19 @@
 {
-  "name": "matterjs-ts-ghpages-demo",
-  "version": "1.0.0",
+  "name": "matter-car",
   "private": true,
+  "version": "0.0.1",
+  "type": "module",
   "scripts": {
-    "build": "esbuild src/main.ts --bundle --minify --sourcemap --outfile=docs/bundle.js --format=iife --global-name=App",
-    "dev": "esbuild src/main.ts --bundle --sourcemap --outfile=docs/bundle.js --format=iife --servedir=docs --serve=5173",
-    "clean": "rm -rf docs/bundle.js docs/bundle.js.map"
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0",
+    "typescript": "^5.0.0",
+    "@types/matter-js": "^0.19.6"
   },
   "dependencies": {
     "matter-js": "^0.19.0"
-  },
-  "devDependencies": {
-    "esbuild": "^0.21.0",
-    "typescript": "^5.3.0"
   }
 }
